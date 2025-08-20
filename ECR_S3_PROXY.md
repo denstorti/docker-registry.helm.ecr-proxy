@@ -344,13 +344,14 @@ kubectl exec -n $NAMESPACE irsa-test -- aws s3 ls s3://registry-denisstorti/
 
 **Fix 1: Recreate IAM Role with Correct Trust Policy**
 ```bash
+AWS_ACCOUNT_ID=281387974444
 # Delete existing role
-aws iam detach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::281387974444:policy/DockerRegistryS3Policy
+aws iam detach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
 aws iam delete-role --role-name DockerRegistryS3Role
 
 # Get correct OIDC issuer (without https://)
 OIDC_ISSUER=$(aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')
-
+AWS_ACCOUNT_ID=281387974444
 # Recreate trust policy with correct issuer
 cat > trust-policy.json << EOF
 {
@@ -359,15 +360,22 @@ cat > trust-policy.json << EOF
         {
             "Effect": "Allow",
             "Principal": {
-                "Federated": "arn:aws:iam::281387974444:oidc-provider/\$OIDC_ISSUER"
+                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
             },
             "Action": "sts:AssumeRoleWithWebIdentity",
             "Condition": {
                 "StringEquals": {
-                    "\$OIDC_ISSUER:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
-                    "\$OIDC_ISSUER:aud": "sts.amazonaws.com"
+                    "${OIDC_ISSUER}:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
+                    "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
                 }
             }
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/DockerRegistryS3Role"
+            },
+            "Action": "sts:AssumeRole"
         }
     ]
 }
@@ -375,7 +383,7 @@ EOF
 
 # Recreate role
 aws iam create-role --role-name DockerRegistryS3Role --assume-role-policy-document file://trust-policy.json
-aws iam attach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::281387974444:policy/DockerRegistryS3Policy
+aws iam attach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
 ```
 
 **Fix 2: Use eksctl for IRSA (Recommended)**

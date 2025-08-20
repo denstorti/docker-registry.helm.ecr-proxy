@@ -87,7 +87,7 @@ secrets:
 #     accountKey: ""
 #     container: ""
 # Secrets for S3 access and secret keys
-# Use a secretRef with keys (accessKey, secretKey) for secrets stored outside the chart
+# When using IRSA, leave these empty as AWS credentials are provided automatically
   s3:
     secretRef: ""
     accessKey: ""
@@ -226,7 +226,10 @@ extraVolumeMounts: []
 #    name: cloudfront-pem-secret
 #    readOnly: true
 
-extraVolumes: []
+extraVolumes:
+  - emptyDir: {}
+    name: aws-credentials
+
 ## Additional volumes to the pod.
 #  - name: cloudfront-pem-secret
 #    secret:
@@ -241,12 +244,55 @@ extraEnvVars: []
 # - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
 #   value: "/var/lib/example"
 
-initContainers: []
+initContainers:
 ## Init containers to add to the Deployment
-# - name: init
-#   image: busybox
-#   command: []
+- name: credential-refresher-sidecar
+  image: public.ecr.aws/aws-cli/aws-cli:latest
+  command:
+    - /bin/sh
+    - -c
+    - |
+      set -e
 
+      # Function to get credentials
+      get_credentials() {
+        echo "Getting AWS credentials..."
+        echo WHOAMI: $(whoami)
+        echo AWS_ROLE_ARN: $AWS_ROLE_ARN
+        CREDS=$(aws sts assume-role --role-arn $AWS_ROLE_ARN --role-session-name harbor-session --duration-seconds 3600 --output text)
+        ACCESS_KEY=$(echo "$CREDS" | grep CREDENTIALS | cut -f2)
+        SECRET_KEY=$(echo "$CREDS" | grep CREDENTIALS | cut -f4)
+        SESSION_TOKEN=$(echo "$CREDS" | grep CREDENTIALS | cut -f5)
+
+        cat > /root/.aws/credentials << EOF
+      [default]
+      aws_access_key_id = $ACCESS_KEY
+      aws_secret_access_key = $SECRET_KEY
+      aws_session_token = $SESSION_TOKEN
+      EOF
+
+        echo "Credentials updated at $(date)"
+      }
+
+      get_credentials
+
+      while true; do
+        sleep 1800  # 30 minutes
+        get_credentials
+      done &
+
+      # Keep container running
+      tail -f /dev/null
+  restartPolicy: Always
+  securityContext:
+    runAsUser: 0
+  env:
+    - name: AWS_REGION
+      value: us-east-1
+  volumeMounts:
+    - mountPath: /root/.aws
+      name: aws-credentials
+      
 garbageCollect:
   enabled: false
   deleteUntagged: true
