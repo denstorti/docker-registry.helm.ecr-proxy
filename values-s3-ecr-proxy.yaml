@@ -277,11 +277,21 @@ initContainers:
         echo "Credentials updated at $(date)"
       }
 
+      get_ecr_credentials() {
+        echo "Getting ECR credentials..."
+        ECR_TOKEN=$(aws ecr get-login-password --region us-east-1)
+        echo $ECR_TOKEN > /root/ecr-token.txt
+        cat /root/ecr-token.txt # DEBUG ONLY
+        echo "ECR credentials updated at $(date)"
+      }
+
       get_credentials
+      get_ecr_credentials
 
       while true; do
-        sleep 1800  # 30 minutes
+        sleep 5  # 5 seconds for DEBUG, ideally 30~45 minutes (less than 1 hour)
         get_credentials
+        get_ecr_credentials
       done &
 
       # Keep container running

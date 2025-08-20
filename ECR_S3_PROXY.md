@@ -10,6 +10,14 @@
 
 `aws ecr create-repository --repository-name nginx --region us-east-1`
 
+# Create Cluster
+
+```
+CLUSTER_NAME=eks-docker-registry-proxy-cache
+eksctl create cluster --name $CLUSTER_NAME --region us-east-1 --node-type t3.small --nodes 3 --node-volume-size 20 --spot
+eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME --approve
+```
+
 # Create S3 bucket
 
 1. Create bucket:
@@ -98,7 +106,7 @@ kubectl create secret -n $NAMESPACE generic s3-credentials --from-literal=s3Acce
 Set `s3.bucket` to `$AWS_BUCKET_NAME` in the values files.
 
 
-# Create secret for ECR credentials
+# Create secret for ECR credentials (just DEBUG, expires in 12 hours)
 
 Temporary creds with auth token:
 
@@ -205,51 +213,45 @@ aws iam create-policy \
 
 Output: `arn:aws:iam::$AWS_ACCOUNT_ID:policy/DockerRegistryS3Policy`
 
-2. **Create IAM role for service account**:
+# Create ECR get Auth token policy
+
+Note: using `Resource": "*"` instead of `Resource": "arn:aws:ecr:*:${AWS_ACCOUNT_ID}:repository/*"` as `ecr:GetAuthorizationToken` needs it.
+
 ```bash
-CLUSTER_NAME=eks-docker-registry-proxy-cache
-NAMESPACE=docker-registry-proxy-cache
-SERVICE_ACCOUNT_NAME=docker-registry-sa
+AWS_ACCOUNT_ID=281387974444
+AWS_ECR_NAME=281387974444.dkr.ecr.us-east-1.amazonaws.com
 
-# Get OIDC issuer URL
-OIDC_ISSUER=$(aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text)
-
-# Create trust policy
-cat > trust-policy.json << EOF
+cat > ecr-registry-policy.json << EOF
 {
     "Version": "2012-10-17",
     "Statement": [
         {
             "Effect": "Allow",
-            "Principal": {
-                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER#https://}"
-            },
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {
-                "StringEquals": {
-                    "${OIDC_ISSUER#https://}:sub": "system:serviceaccount:${NAMESPACE}:${SERVICE_ACCOUNT_NAME}",
-                    "${OIDC_ISSUER#https://}:aud": "sts.amazonaws.com"
-                }
-            }
+            "Action": [
+                "ecr:GetAuthorizationToken",
+                "ecr:BatchCheckLayerAvailability",
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:GetRepositoryPolicy",
+                "ecr:DescribeRepositories",
+                "ecr:ListImages",
+                "ecr:BatchGetImage"
+            ],
+            "Resource": "*" 
         }
     ]
 }
 EOF
 
-# Create IAM role
-aws iam create-role \
-    --role-name DockerRegistryS3Role \
-    --assume-role-policy-document file://trust-policy.json
-
-# Attach policy to role
-aws iam attach-role-policy \
-    --role-name DockerRegistryS3Role \
-    --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
+aws iam create-policy \
+    --policy-name DockerRegistryECRPolicy \
+    --policy-document file://ecr-registry-policy.json
 ```
 
-Output: `arn:aws:iam::$AWS_ACCOUNT_ID:role/DockerRegistryS3Role`
 
-3. **Update values file to use service account**:
+
+1. **Create IAM role for service account**:
+
+2. **Update values file to use service account**:
 Replace `<AWS_ACCOUNT_ID>` with the AWS account ID.
 ```yaml
 serviceAccount:
@@ -375,6 +377,31 @@ cat > trust-policy.json << EOF
                     "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
                 }
             }
+        }
+    ]
+}
+EOF
+
+# Recreate role
+aws iam create-role --role-name DockerRegistryS3Role --assume-role-policy-document file://trust-policy.json
+
+# Update policy to allow the role to assume itself
+cat > trust-policy.json << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "${OIDC_ISSUER}:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
+                    "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
+                }
+            }
         },
         {
             "Effect": "Allow",
@@ -387,9 +414,13 @@ cat > trust-policy.json << EOF
 }
 EOF
 
-# Recreate role
-aws iam create-role --role-name DockerRegistryS3Role --assume-role-policy-document file://trust-policy.json
+aws iam update-assume-role-policy --role-name DockerRegistryS3Role --policy-document file://trust-policy.json
+
+# Attach S3 permissions
 aws iam attach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
+
+# Attach ECR permissions
+aws iam attach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
 ```
 
 **Fix 2: Use eksctl for IRSA (Recommended)**
