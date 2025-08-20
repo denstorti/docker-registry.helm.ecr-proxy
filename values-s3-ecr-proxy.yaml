@@ -97,7 +97,7 @@ secrets:
 #     username: ""
 #     password: ""
 
-# Options for s3 storage type:
+# Options for s3 storage type:  # MODIFIED
 s3:
   region: us-east-1
   regionEndpoint: https://s3.us-east-1.amazonaws.com
@@ -115,14 +115,14 @@ s3:
 
 # https://docs.docker.com/registry/recipes/mirror/
 proxy:
-  enabled: true # MODIFIED to true
+  enabled: false # MODIFIED to true
   # remoteurl: https://quay.io
   remoteurl: https://281387974444.dkr.ecr.us-east-1.amazonaws.com
   username: "" 
   password: ""
   # the ref for a secret stored outside of this chart
   # Keys: proxyUsername, proxyPassword
-  secretRef: ecr-regcred
+  secretRef: ""
 
 metrics:
   enabled: false
@@ -220,13 +220,12 @@ affinity: {}
 
 tolerations: []
 
-extraVolumeMounts: []
-## Additional volumeMounts to the registry container.
-#  - mountPath: /secret-data
-#    name: cloudfront-pem-secret
-#    readOnly: true
+extraVolumeMounts: # MODIFIED
+  - mountPath: /.aws
+    name: aws-credentials
+    readOnly: true
 
-extraVolumes:
+extraVolumes: # MODIFIED
   - emptyDir: {}
     name: aws-credentials
 
@@ -239,10 +238,14 @@ extraVolumes:
 #          path: cloudfront.pem
 #          mode: 511
 
-extraEnvVars: []
+extraEnvVars: # MODIFIED
 ## Additional ENV variables to set
-# - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
-#   value: "/var/lib/example"
+- name: AWS_WEB_IDENTITY_TOKEN_FILE # Supress Web Identity credentials to prioritize /.aws/credentials
+  value: ""
+- name: AWS_ROLE_ARN
+  value: ""
+- name: AWS_SHARED_CREDENTIALS_FILE 
+  value: "/.aws/credentials"
 
 initContainers:
 ## Init containers to add to the Deployment
@@ -259,7 +262,7 @@ initContainers:
         echo "Getting AWS credentials..."
         echo WHOAMI: $(whoami)
         echo AWS_ROLE_ARN: $AWS_ROLE_ARN
-        CREDS=$(aws sts assume-role --role-arn $AWS_ROLE_ARN --role-session-name harbor-session --duration-seconds 3600 --output text)
+        CREDS=$(aws sts assume-role --role-arn $AWS_ROLE_ARN --role-session-name registry-proxy-session --duration-seconds 3600 --output text)
         ACCESS_KEY=$(echo "$CREDS" | grep CREDENTIALS | cut -f2)
         SECRET_KEY=$(echo "$CREDS" | grep CREDENTIALS | cut -f4)
         SESSION_TOKEN=$(echo "$CREDS" | grep CREDENTIALS | cut -f5)

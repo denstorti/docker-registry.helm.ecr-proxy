@@ -120,6 +120,12 @@ NAMESPACE=docker-registry-proxy-cache
 helm install docker-registry . --namespace $NAMESPACE --create-namespace --values values-s3-ecr-proxy.yaml
 ```
 
+# Test image push
+
+```
+crane copy alpine:latest localhost:8000/alpine:latest
+```
+
 # Troubleshooting
 
 ## S3 Access Denied Error
