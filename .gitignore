@@ -1,1 +1,3 @@
 .cr-release-packages
+s3-registry-policy.json
+trust-policy.json
