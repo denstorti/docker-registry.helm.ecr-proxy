@@ -19,8 +19,8 @@ serviceAccount:
     eks.amazonaws.com/role-arn: "arn:aws:iam::281387974444:role/DockerRegistryS3Role"
 
 image:
-  repository: registry
-  tag: 3.0.0
+  repository: denstorti/docker-registry-ecr # MODIFIED to registry-ecr-image from registry
+  tag: latest
   pullPolicy: IfNotPresent
 # imagePullSecrets:
     # - name: docker
@@ -141,6 +141,7 @@ configPath: /etc/distribution
 configData:
   version: 0.1
   log:
+    level: debug
     fields:
       service: registry
   storage:
@@ -160,6 +161,13 @@ configData:
       enabled: true
       interval: 10s
       threshold: 3
+  proxy:
+    remoteurl: https://281387974444.dkr.ecr.us-east-1.amazonaws.com
+    # username: "AWS" 
+    # password: ""
+    exec: 
+      command: /usr/bin/docker-credential-ecr-login
+      lifetime: 12h 
 
 containerSecurityContext:
   enabled: true
@@ -224,10 +232,15 @@ extraVolumeMounts: # MODIFIED
   - mountPath: /.aws
     name: aws-credentials
     readOnly: true
+  - mountPath: /.docker
+    name: docker-config
+    readOnly: true
 
 extraVolumes: # MODIFIED
   - emptyDir: {}
     name: aws-credentials
+  - emptyDir: {}
+    name: docker-config
 
 ## Additional volumes to the pod.
 #  - name: cloudfront-pem-secret
@@ -244,8 +257,12 @@ extraEnvVars: # MODIFIED
   value: ""
 - name: AWS_ROLE_ARN
   value: ""
+- name: OTEL_TRACES_EXPORTER  # Disable tracer, DEV ONLY
+  value: "none"
 - name: AWS_SHARED_CREDENTIALS_FILE 
   value: "/.aws/credentials"
+# - name: DOCKER_CONFIG # non-default location for Docker config. Don't append config.json.
+#   value: "/.aws"
 
 initContainers:
 ## Init containers to add to the Deployment
@@ -280,18 +297,55 @@ initContainers:
       get_ecr_credentials() {
         echo "Getting ECR credentials..."
         ECR_TOKEN=$(aws ecr get-login-password --region us-east-1)
-        echo $ECR_TOKEN > /root/ecr-token.txt
-        cat /root/ecr-token.txt # DEBUG ONLY
+        echo $ECR_TOKEN > /root/.aws/ecr-token.txt
+        cat /root/.aws/ecr-token.txt # DEBUG ONLY
         echo "ECR credentials updated at $(date)"
+      }
+
+      write_ecr_docker_config() {
+        local config_path="${1:-/root/.docker/config.json}"  # Docker config in non-default location
+        mkdir -p "$(dirname "$config_path")"
+        # Infer AWS region
+        local region="${AWS_REGION:-us-east-1}"
+        # Extract AWS account ID from AWS_ROLE_ARN (arn:aws:iam::<account-id>:role/...)
+        if [[ -n "${AWS_ROLE_ARN:-}" ]]; then
+          local aws_account_id
+          aws_account_id=$(echo "$AWS_ROLE_ARN" | cut -d: -f5)
+        else
+          echo "❌ AWS_ROLE_ARN not set" >&2
+          return 1
+        fi
+        # Construct registry URL
+        local ecr_registry="${aws_account_id}.dkr.ecr.${region}.amazonaws.com"
+        # Get password from AWS CLI
+        local password
+        password=$(aws ecr get-login-password --region "$region")
+        # Build base64-encoded auth (AWS:<password>)
+        local auth
+        auth=$(echo -n "AWS:${password}" | base64 | tr -d '\n')
+        cat > "$config_path" <<EOF
+      {
+        "auths": {
+          "${ecr_registry}": {
+            "auth": "${auth}"
+          }
+        }
+      }
+      EOF
+        echo "✅ Wrote Docker config for ECR registry: $ecr_registry"
+        cat "$config_path" 
+        echo "📄 Location: $config_path"
       }
 
       get_credentials
       get_ecr_credentials
+      write_ecr_docker_config
 
       while true; do
-        sleep 5  # 5 seconds for DEBUG, ideally 30~45 minutes (less than 1 hour)
+        sleep 15  # 15 seconds for DEBUG, ideally 30~45 minutes (less than 1 hour)
         get_credentials
         get_ecr_credentials
+        write_ecr_docker_config
       done &
 
       # Keep container running
@@ -305,7 +359,9 @@ initContainers:
   volumeMounts:
     - mountPath: /root/.aws
       name: aws-credentials
-      
+    - mountPath: /root/.docker
+      name: docker-config
+
 garbageCollect:
   enabled: false
   deleteUntagged: true
