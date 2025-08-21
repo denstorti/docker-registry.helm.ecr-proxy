@@ -1,43 +1,147 @@
 
 # Overview
 
-- Uses Service NodePort to expose the registry to nodes.
-- Uses S3 bucket to store images and return pre-signed URLs, avoiding the data to go through the registry pods, which can incur cross-AZ traffic costs in AWS.
-- Uses ECR as upstream registry for the proxy.
-- ECR authentication is done only with auth token with expiration of 12 hours, and the solution is running sidecar pods to refresh the token every 8 hours, and an init container to fetch the token when the registry is started.
+This is a setup to use distribution/distribution Docker registry with S3 as storage and ECR as upstream registries.
 
-# Create ECR repository
+Solution:
+- S3 cross-AZ costs are free as the registry returns pre-signed URLs to the client. No overhead on the registry to proxy the blobs data to the consumer (node).
+- Uses a private ECR as upstream registry for the proxy.
+- ECR authentication is only user/password or via docker-credential-helper. Use/password is not viable for production as tokens expire in 12 hours. Solution was using another custom image for the `registry:3.0.0` image, and using the `docker-credential-ecr-login` helper to get the auth token via the supported `proxy.exec.command` config data option. 
+- Uses Service NodePort to expose the registry to nodes. Nodes are the ones pulling the image and need to find a way to point to the registry service --> pods. Another solution would be using an ALB/NLB pointing to the registry service and use it in pod `spec.containers[].image` instead of localhost.
 
-`aws ecr create-repository --repository-name nginx --region us-east-1`
+# Prerequisites
+
+- AWS account for the cluster, S3 bucket and ECR repository.
+- eksctl
+- docker/podman
+- helm
+
+# Clean up 
+
+```
+CLUSTER_NAME=eks-docker-registry-proxy-cache
+AWS_ACCOUNT_ID=281387974444
+ROLE_NAME=DockerRegistryRole
+
+eksctl delete cluster --name $CLUSTER_NAME
+
+# Detach policies from role
+aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
+aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
+
+# Delete role
+aws iam delete-role --role-name $ROLE_NAME
+
+# Delete policies
+aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
+aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
+# Bucket needs to be empty
+aws s3api delete-bucket --bucket registry-denisstorti --region us-east-1
+```
+
 
 # Create Cluster
 
 ```
 CLUSTER_NAME=eks-docker-registry-proxy-cache
 eksctl create cluster --name $CLUSTER_NAME --region us-east-1 --node-type t3.small --nodes 3 --node-volume-size 20 --spot
+
+# Create OIDC provider, needed for AWS IRSA authentication
 eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME --approve
+```
+
+# Create IAM role for the registry
+
+This IAM Role will be used by the init container to fetch AWS credentials and mount them in the registry container.
+
+The role needs permissions to assume itself as it'll generate credentials that will be mounted in the registry container.
+The reason is Web Identity federation is not supported by docker registry at the moment.
+
+```bash
+AWS_ACCOUNT_ID=281387974444
+ROLE_NAME=DockerRegistryRole
+
+# Get correct OIDC issuer (without https://)
+OIDC_ISSUER=$(aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')
+AWS_ACCOUNT_ID=281387974444
+# Recreate trust policy with correct issuer
+cat > trust-policy.json << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "${OIDC_ISSUER}:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
+                    "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
+                }
+            }
+        }
+    ]
+}
+EOF
+
+# Recreate role
+aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json
+
+# Update policy to allow the role to assume itself
+cat > trust-policy.json << EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "${OIDC_ISSUER}:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
+                    "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/$ROLE_NAME"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+EOF
+
+aws iam update-assume-role-policy --role-name $ROLE_NAME --policy-document file://trust-policy.json
 ```
 
 # Create S3 bucket
 
-1. Create bucket:
+1. Create bucket. Replace `BUCKET_NAME` with your bucket name.
 ```
 AWS_BUCKET_NAME=registry-denisstorti
 aws s3api create-bucket --bucket $AWS_BUCKET_NAME --region us-east-1
 ```
 
-2. Set bucket policy to allow the registry to read and write to the bucket. Replace `<AWS_ACCOUNT_ID>` with the AWS account ID.
+1. Set bucket policy to allow the IAM role for the registry to read and write to the bucket. Update `AWS_ACCOUNT_ID` with your AWS account ID.
 
-**For IAM User Access:**
 ```bash
-AWS_ACCOUNT_ID=281387974444
+AWS_ACCOUNT_ID=281387974444 # Update with your AWS account ID
+ROLE_NAME=DockerRegistryRole
+
 aws s3api put-bucket-policy --bucket $AWS_BUCKET_NAME --policy '{
     "Version": "2012-10-17",
     "Statement": [
         {
             "Effect": "Allow",
             "Principal": {
-                "AWS": "arn:aws:iam::'$AWS_ACCOUNT_ID':root"
+                "AWS": "arn:aws:iam::'$AWS_ACCOUNT_ID':role/'$ROLE_NAME'"
             },
             "Action": [
                 "s3:ListBucket",
@@ -45,7 +149,10 @@ aws s3api put-bucket-policy --bucket $AWS_BUCKET_NAME --policy '{
                 "s3:ListBucketMultipartUploads",
                 "s3:GetObject",
                 "s3:PutObject",
-                "s3:DeleteObject"
+                "s3:DeleteObject",
+
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts"
             ],
             "Resource": [
                 "arn:aws:s3:::'$AWS_BUCKET_NAME'",
@@ -54,130 +161,8 @@ aws s3api put-bucket-policy --bucket $AWS_BUCKET_NAME --policy '{
         }
     ]
 }'
-```
 
-**For IRSA Role Access (Recommended):**
-```bash
-AWS_ACCOUNT_ID=281387974444
-aws s3api put-bucket-policy --bucket $AWS_BUCKET_NAME --policy '{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "AWS": "arn:aws:iam::'$AWS_ACCOUNT_ID':role/DockerRegistryS3Role"
-            },
-            "Action": [
-                "s3:ListBucket",
-                "s3:GetBucketLocation",
-                "s3:ListBucketMultipartUploads"
-            ],
-            "Resource": "arn:aws:s3:::'$AWS_BUCKET_NAME'"
-        },
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "AWS": "arn:aws:iam::'$AWS_ACCOUNT_ID':role/DockerRegistryS3Role"
-            },
-            "Action": [
-                "s3:GetObject",
-                "s3:PutObject",
-                "s3:DeleteObject",
-                "s3:AbortMultipartUpload",
-                "s3:ListMultipartUploadParts"
-            ],
-            "Resource": "arn:aws:s3:::'$AWS_BUCKET_NAME'/*"
-        }
-    ]
-}'
-```
-
-
-# Create secret for S3 credentials
-
-Create AWS user to access the S3 bucket with bucket permissions and create access key.
-
-Create K8s secret with the access key and secret key:
-```
-NAMESPACE=docker-registry-proxy-cache
-kubectl create secret -n $NAMESPACE generic s3-credentials --from-literal=s3AccessKey=XXX --from-literal=s3SecretKey=XXX
-```
-
-Set `s3.bucket` to `$AWS_BUCKET_NAME` in the values files.
-
-
-# Create secret for ECR credentials (just DEBUG, expires in 12 hours)
-
-Temporary creds with auth token:
-
-```
-AWS_ACCOUNT_ID=281387974444
-NAMESPACE=docker-registry-proxy-cache
-
-PASSWORD=$(aws ecr get-login-password --region us-east-1)
-
-kubectl create secret -n $NAMESPACE generic ecr-regcred --from-literal=proxyUsername=AWS --from-literal=proxyPassword=$PASSWORD
-```
-
-Set `proxy.secretRef` to `ecr-regcred` in the values files.
-
-# Install Helm chart
-
-```
-NAMESPACE=docker-registry-proxy-cache
-helm install docker-registry . --namespace $NAMESPACE --create-namespace --values values-s3-ecr-proxy.yaml
-```
-
-# Test image push
-
-```
-crane copy alpine:latest localhost:8000/alpine:latest
-```
-
-# Troubleshooting
-
-## S3 Access Denied Error
-
-If you encounter this error:
-```
-panic: s3aws: AccessDenied: User: arn:aws:sts::281387974444:assumed-role/eksctl-eks-docker-registry-proxy-c-NodeInstanceRole-gdmFm87KxHTG/i-0c8397d78465865e2 is not authorized to perform: s3:ListBucket on resource: "arn:aws:s3:::registry-denisstorti" because no identity-based policy allows the s3:ListBucket action
-status code: 403, request id: EGF2W2JK25V8RX8A, host id: ZvAalbIGtttz9LqTpmgtbjNRZrEJiZ3OOAxxPeSAdTWw2DP7eV5X9ib1hOP+uoZeE9nTmLx3Pzc=
-```
-
-**Root Cause**: The registry is not using the S3 credentials from the Kubernetes secret and is falling back to the EKS node instance role.
-
-### Solution 1: Fix S3 Credentials Configuration
-
-1. **Verify the secret exists and has correct keys**:
-```bash
-NAMESPACE=docker-registry-proxy-cache
-kubectl get secret -n $NAMESPACE s3-credentials -o yaml
-```
-
-2. **Check the secret has the correct keys** (`s3AccessKey` and `s3SecretKey`):
-```bash
-kubectl get secret -n $NAMESPACE s3-credentials -o jsonpath='{.data}' | jq 'keys'
-```
-
-3. **Update the values file to properly reference the secret**:
-In `values-s3-ecr-proxy.yaml`, ensure:
-```yaml
-secrets:
-  s3:
-    secretRef: "s3-credentials"  # Reference to the secret name
-    accessKey: ""               # Leave empty when using secretRef
-    secretKey: ""               # Leave empty when using secretRef
-```
-
-### Solution 2: Use IAM Roles for Service Accounts (IRSA) - Recommended
-
-Instead of using IAM user credentials, use IRSA for better security:
-
-1. **Create an IAM policy for S3 access**:
-```bash
-AWS_ACCOUNT_ID=281387974444
-AWS_BUCKET_NAME=registry-denisstorti
-
+# Create policy for S3 access
 cat > s3-registry-policy.json << EOF
 {
     "Version": "2012-10-17",
@@ -209,17 +194,18 @@ EOF
 aws iam create-policy \
     --policy-name DockerRegistryS3Policy \
     --policy-document file://s3-registry-policy.json
+
+# Attach the policy to the role:
+aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
 ```
 
-Output: `arn:aws:iam::$AWS_ACCOUNT_ID:policy/DockerRegistryS3Policy`
-
-# Create ECR get Auth token policy
+# Create policy for ECR access
 
 Note: using `Resource": "*"` instead of `Resource": "arn:aws:ecr:*:${AWS_ACCOUNT_ID}:repository/*"` as `ecr:GetAuthorizationToken` needs it.
 
 ```bash
+ROLE_NAME=DockerRegistryRole
 AWS_ACCOUNT_ID=281387974444
-AWS_ECR_NAME=281387974444.dkr.ecr.us-east-1.amazonaws.com
 
 cat > ecr-registry-policy.json << EOF
 {
@@ -245,195 +231,77 @@ EOF
 aws iam create-policy \
     --policy-name DockerRegistryECRPolicy \
     --policy-document file://ecr-registry-policy.json
+
+# Attach the policy to the role:
+aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
 ```
 
 
+# Build Custom registry image with docker-credential-ecr-login helper
 
-1. **Create IAM role for service account**:
+Let's build a custom registry image with the `docker-credential-ecr-login` helper.
 
-2. **Update values file to use service account**:
-Replace `<AWS_ACCOUNT_ID>` with the AWS account ID.
-```yaml
-serviceAccount:
-  create: true
-  name: "docker-registry-sa"
-  annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::<AWS_ACCOUNT_ID>:role/DockerRegistryS3Role"
-
-# Remove S3 credentials when using IRSA
-secrets:
-  s3:
-    secretRef: ""
-    accessKey: ""
-    secretKey: ""
+```
+docker build registry-ecr-image/ -t docker-registry-ecr-proxy:3.0.0
 ```
 
-## IRSA Troubleshooting
+For working with EKS, you'll need to push that image to an accessible registry (eg. ECR, DockerHub, quay.io) to be able to pull it in EKS.
 
-If you encounter this error when using IRSA:
-```
-panic: s3aws: WebIdentityErr: failed to retrieve credentials
-    caused by: SerializationError: failed to unmarshal error message
-        status code: 405, request id:
-    caused by: UnmarshalError: failed to unmarshal error message
-```
+Just remember to set in values files `values-s3-ecr-proxy.yaml`:
+- `image.repository` to the public registry image name.
+- `image.tag` to the custom image tag.
+- `image.pullPolicy` to `Always`.
 
-This indicates a "MethodNotAllowed" error from STS. Follow these steps to diagnose:
+# Configure Helm chart
 
-### 1. Verify OIDC Provider Exists
+Check the `values-s3-ecr-proxy.yaml` file for lines with comment "MODIFIED" to understand what was changed. 
 
-Check if your EKS cluster has an OIDC provider:
+Update details to match your AWS region, AWS account ID, AWS IAM role name and ECR registry URL.
+
+# Install Helm chart
+
+Make sure to have AWS CLI credentials configured and update kube-config:
+
 ```bash
 CLUSTER_NAME=eks-docker-registry-proxy-cache
-aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text
+aws eks update-kubeconfig --name $CLUSTER_NAME
 ```
 
-If no OIDC issuer is returned, create one:
-```bash
-eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME --approve
-```
-
-### 2. Verify OIDC Provider in IAM
-
-List OIDC providers and check if your cluster's provider exists:
-```bash
-aws iam list-open-id-connect-providers
-```
-
-The output should include your cluster's OIDC issuer URL.
-
-### 3. Check Service Account and Pod
-
-Verify the service account is created with correct annotations:
+Install helm chart: 
 ```bash
 NAMESPACE=docker-registry-proxy-cache
-kubectl get serviceaccount -n $NAMESPACE docker-registry-sa -o yaml
+helm install docker-registry . --namespace $NAMESPACE --create-namespace --values values-s3-ecr-proxy.yaml
 ```
 
-Check if the pod is using the service account:
-```bash
-kubectl get pods -n $NAMESPACE -o yaml | grep -A5 -B5 serviceAccount
-```
+# Validate installation
 
-### 4. Verify IAM Role Trust Policy
-
-Check the trust policy of your IAM role:
-```bash
-aws iam get-role --role-name DockerRegistryS3Role --query 'Role.AssumeRolePolicyDocument'
-```
-
-The trust policy should match your cluster's OIDC issuer and namespace/service account.
-
-### 5. Test IRSA from Pod
-
-Create a test pod to verify IRSA is working:
-```bash
-cat << EOF | kubectl apply -f -
-apiVersion: v1
-kind: Pod
-metadata:
-  name: irsa-test
-  namespace: $NAMESPACE
-spec:
-  serviceAccountName: docker-registry-sa
-  containers:
-  - name: aws-cli
-    image: amazon/aws-cli:latest
-    command: ['sleep', '3600']
-  restartPolicy: Never
-EOF
-
-# Test AWS credentials
-kubectl exec -n $NAMESPACE irsa-test -- aws sts get-caller-identity
-kubectl exec -n $NAMESPACE irsa-test -- aws s3 ls s3://registry-denisstorti/
-```
-
-### 6. Common Fixes
-
-**Fix 1: Recreate IAM Role with Correct Trust Policy**
+Push an image to the private ECR registry:
 ```bash
 AWS_ACCOUNT_ID=281387974444
-# Delete existing role
-aws iam detach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
-aws iam delete-role --role-name DockerRegistryS3Role
+# Create ECR repository
+aws ecr create-repository --repository-name nginx --region us-east-1
 
-# Get correct OIDC issuer (without https://)
-OIDC_ISSUER=$(aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | sed 's|https://||')
-AWS_ACCOUNT_ID=281387974444
-# Recreate trust policy with correct issuer
-cat > trust-policy.json << EOF
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
-            },
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {
-                "StringEquals": {
-                    "${OIDC_ISSUER}:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
-                    "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
-                }
-            }
-        }
-    ]
-}
-EOF
+# Authenticate with ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
 
-# Recreate role
-aws iam create-role --role-name DockerRegistryS3Role --assume-role-policy-document file://trust-policy.json
-
-# Update policy to allow the role to assume itself
-cat > trust-policy.json << EOF
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/${OIDC_ISSUER}"
-            },
-            "Action": "sts:AssumeRoleWithWebIdentity",
-            "Condition": {
-                "StringEquals": {
-                    "${OIDC_ISSUER}:sub": "system:serviceaccount:docker-registry-proxy-cache:docker-registry-sa",
-                    "${OIDC_ISSUER}:aud": "sts.amazonaws.com"
-                }
-            }
-        },
-        {
-            "Effect": "Allow",
-            "Principal": {
-                "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/DockerRegistryS3Role"
-            },
-            "Action": "sts:AssumeRole"
-        }
-    ]
-}
-EOF
-
-aws iam update-assume-role-policy --role-name DockerRegistryS3Role --policy-document file://trust-policy.json
-
-# Attach S3 permissions
-aws iam attach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
-
-# Attach ECR permissions
-aws iam attach-role-policy --role-name DockerRegistryS3Role --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
+# Push image with crane (your use Docker tag + Docker push)
+crane copy --platform linux/amd64 nginx:latest ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/nginx:latest
 ```
 
-**Fix 2: Use eksctl for IRSA (Recommended)**
+Run a pod to pull the image from the private ECR registry through the proxy:
 ```bash
-# Delete existing service account
-kubectl delete serviceaccount -n docker-registry-proxy-cache docker-registry-sa
+kubectl run -n $NAMESPACE --rm -it nginx --image localhost:30008/nginx:latest --restart Never sh
 
-# Create service account with IRSA using eksctl
-eksctl create iamserviceaccount \
-    --cluster=$CLUSTER_NAME \
-    --namespace=docker-registry-proxy-cache \
-    --name=docker-registry-sa \
-    --attach-policy-arn=arn:aws:iam::281387974444:policy/DockerRegistryS3Policy \
-    --override-existing-serviceaccounts \
-    --approve
+# Check if pod is Running or if there was a ImgPullErr
+kubectl get pods -n $NAMESPACE nginx --watch
+```
+
+To confirm the image was cached in S3, check the S3 bucket.
+It should contain a path similar to this `s3://<BUCKET_NAME>/docker/registry/v2/repositories/nginx/_manifests/tags/latest`, indicating the image was cached.
+
+To confirm the cache is pulling from the private ECR, you can test a tag that only exists in Docker Hub and not in ECR, or you can push other custom tags to ECR only and run it in a pod to confirm the manifest for those custom tags are indeed coming from the private ECR.
+```
+crane copy --platform linux/amd64 nginx:latest 281387974444.dkr.ecr.us-east-1.amazonaws.com/nginx:v1
+
+kubectl run -n $NAMESPACE --rm -it nginx --image localhost:30008/nginx:v1 --restart Never sh
 ```

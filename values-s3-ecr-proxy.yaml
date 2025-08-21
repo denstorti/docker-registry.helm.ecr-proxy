@@ -12,16 +12,16 @@ updateStrategy: {}
 podAnnotations: {}
 podLabels: {}
 
-serviceAccount:
+serviceAccount: # MODIFIED to enable IRSA
   create: true
   name: "docker-registry-sa"
   annotations:
-    eks.amazonaws.com/role-arn: "arn:aws:iam::281387974444:role/DockerRegistryS3Role"
+    eks.amazonaws.com/role-arn: "arn:aws:iam::281387974444:role/DockerRegistryRole" 
 
 image:
   repository: denstorti/docker-registry-ecr # MODIFIED to registry-ecr-image from registry
   tag: latest
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 # imagePullSecrets:
     # - name: docker
 deployment: {}
@@ -33,7 +33,7 @@ service:
   # sessionAffinityConfig: {}
   # clusterIP:
   port: 5000
-  nodePort: 30008 # MODIFIED to enable
+  nodePort: 30008 # MODIFIED to set node port
   # loadBalancerIP:
   # loadBalancerSourceRanges:
   annotations: {}
@@ -97,8 +97,8 @@ secrets:
 #     username: ""
 #     password: ""
 
-# Options for s3 storage type:  # MODIFIED
-s3:
+# Options for s3 storage type
+s3: # MODIFIED to use S3 as storage type
   region: us-east-1
   regionEndpoint: https://s3.us-east-1.amazonaws.com
   bucket: registry-denisstorti
@@ -114,15 +114,15 @@ s3:
 #   container: my-container
 
 # https://docs.docker.com/registry/recipes/mirror/
-proxy:
-  enabled: false # MODIFIED to true
-  # remoteurl: https://quay.io
-  remoteurl: https://281387974444.dkr.ecr.us-east-1.amazonaws.com
-  username: "" 
-  password: ""
-  # the ref for a secret stored outside of this chart
-  # Keys: proxyUsername, proxyPassword
-  secretRef: ""
+# proxy:
+#   enabled: false 
+#   # remoteurl: https://quay.io
+#   remoteurl: https://281387974444.dkr.ecr.us-east-1.amazonaws.com
+#   username: "" 
+#   password: ""
+#   # the ref for a secret stored outside of this chart
+#   # Keys: proxyUsername, proxyPassword
+#   secretRef: ""
 
 metrics:
   enabled: false
@@ -161,10 +161,8 @@ configData:
       enabled: true
       interval: 10s
       threshold: 3
-  proxy:
+  proxy:  # MODIFIED to use the custom image with the docker-credential-ecr-login helper
     remoteurl: https://281387974444.dkr.ecr.us-east-1.amazonaws.com
-    # username: "AWS" 
-    # password: ""
     exec: 
       command: /usr/bin/docker-credential-ecr-login
       lifetime: 12h 
@@ -228,7 +226,7 @@ affinity: {}
 
 tolerations: []
 
-extraVolumeMounts: # MODIFIED
+extraVolumeMounts: # MODIFIED to add volume mounts for AWS credentials
   - mountPath: /.aws
     name: aws-credentials
     readOnly: true
@@ -242,6 +240,7 @@ extraVolumes: # MODIFIED
   - emptyDir: {}
     name: docker-config
 
+
 ## Additional volumes to the pod.
 #  - name: cloudfront-pem-secret
 #    secret:
@@ -253,18 +252,16 @@ extraVolumes: # MODIFIED
 
 extraEnvVars: # MODIFIED
 ## Additional ENV variables to set
-- name: AWS_WEB_IDENTITY_TOKEN_FILE # Supress Web Identity credentials to prioritize /.aws/credentials
+- name: AWS_WEB_IDENTITY_TOKEN_FILE # Supress Web Identity credentials to prioritize /.aws/credentials. Bug in registry doesn't assume the role properly.
   value: ""
 - name: AWS_ROLE_ARN
   value: ""
-- name: OTEL_TRACES_EXPORTER  # Disable tracer, DEV ONLY
-  value: "none"
 - name: AWS_SHARED_CREDENTIALS_FILE 
   value: "/.aws/credentials"
-# - name: DOCKER_CONFIG # non-default location for Docker config. Don't append config.json.
-#   value: "/.aws"
+- name: DOCKER_CONFIG # non-default location for Docker config. Don't append config.json.
+  value: "/.docker"
 
-initContainers:
+initContainers: # MODIFIED: this is where the magic happens for AWS credentials.
 ## Init containers to add to the Deployment
 - name: credential-refresher-sidecar
   image: public.ecr.aws/aws-cli/aws-cli:latest
@@ -292,14 +289,6 @@ initContainers:
       EOF
 
         echo "Credentials updated at $(date)"
-      }
-
-      get_ecr_credentials() {
-        echo "Getting ECR credentials..."
-        ECR_TOKEN=$(aws ecr get-login-password --region us-east-1)
-        echo $ECR_TOKEN > /root/.aws/ecr-token.txt
-        cat /root/.aws/ecr-token.txt # DEBUG ONLY
-        echo "ECR credentials updated at $(date)"
       }
 
       write_ecr_docker_config() {
@@ -338,13 +327,11 @@ initContainers:
       }
 
       get_credentials
-      get_ecr_credentials
       write_ecr_docker_config
 
       while true; do
         sleep 15  # 15 seconds for DEBUG, ideally 30~45 minutes (less than 1 hour)
         get_credentials
-        get_ecr_credentials
         write_ecr_docker_config
       done &
 
@@ -359,8 +346,9 @@ initContainers:
   volumeMounts:
     - mountPath: /root/.aws
       name: aws-credentials
-    - mountPath: /root/.docker
+    - mountPath: /.docker
       name: docker-config
+      readOnly: true
 
 garbageCollect:
   enabled: false

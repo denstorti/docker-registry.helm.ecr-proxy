@@ -1,3 +1,15 @@
+# FORKED VERSION
+
+This is a forked version of the [twuni/docker-registry](https://github.com/twuni/docker-registry) chart.
+
+It adds support for S3 storage and ECR proxy, using IAM roles for service account to get credentials from AWS and leveraging docker-credential-helpers to get auth tokens from ECR.
+
+Check the [ECR_S3_PROXY.md](ECR_S3_PROXY.md) file for more details.
+
+
+# Original README from twuni/docker-registry
+:point_down: :point_down: :point_down:
+
 # Docker Registry Helm Chart
 
 This directory contains a Kubernetes chart to deploy a private Docker Registry.
