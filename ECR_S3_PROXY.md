@@ -70,7 +70,10 @@ cat > trust-policy.json << EOF
     ]
 }
 EOF
+```
 
+Update the role to allow the role to assume itself:
+```bash
 # Recreate role
 aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json
 
@@ -119,6 +122,7 @@ aws s3api create-bucket --bucket $AWS_BUCKET_NAME --region us-east-1
 ```bash
 AWS_ACCOUNT_ID=281387974444 # Update with your AWS account ID
 ROLE_NAME=DockerRegistryRole
+AWS_BUCKET_NAME=registry-denisstorti
 
 aws s3api put-bucket-policy --bucket $AWS_BUCKET_NAME --policy '{
     "Version": "2012-10-17",
