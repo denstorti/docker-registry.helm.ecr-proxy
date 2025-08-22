@@ -3,42 +3,27 @@
 
 This is a setup to use distribution/distribution Docker registry with S3 as storage and ECR as upstream registries.
 
+Problem:
+- Docker distribution `registry` doesn't support Web Identity federation (via IRSA) at the moment.
+- Docker distribution supports only proxy auth via user/password or via docker-credential-helper. Use/password is not viable for production as ECR auth tokens (obtained via `aws ecr get-login-password`) expire in 12 hours.
+
 Solution:
+- The original chart wasn't modified, only the values file was changed. See [values-s3-ecr-proxy.yaml](values-s3-ecr-proxy.yaml).
 - S3 cross-AZ costs are free as the registry returns pre-signed URLs to the client. No overhead on the registry to proxy the blobs data to the consumer (node).
 - Uses a private ECR as upstream registry for the proxy.
-- ECR authentication is only user/password or via docker-credential-helper. Use/password is not viable for production as tokens expire in 12 hours. Solution was using another custom image for the `registry:3.0.0` image, and using the `docker-credential-ecr-login` helper to get the auth token via the supported `proxy.exec.command` config data option. 
+- ECR authentication is only user/password or via docker-credential-helper. Use/password is not viable for production as tokens expire in 12 hours. Solution was using another custom image for the `registry:3.0.0` image, and using the `docker-credential-ecr-login` helper to get the auth token via the supported `proxy.exec.command` config data option. The original registry image `registry:3.0.0` wasn't modified, but instead used as base image.
 - Uses Service NodePort to expose the registry to nodes. Nodes are the ones pulling the image and need to find a way to point to the registry service --> pods. Another solution would be using an ALB/NLB pointing to the registry service and use it in pod `spec.containers[].image` instead of localhost.
+
+![ECR Authentication Flow](AWS_ECR_auth.png)
+
 
 # Prerequisites
 
 - AWS account for the cluster, S3 bucket and ECR repository.
-- eksctl
+- [eksctl](https://eksctl.io/installation/)
 - docker/podman
-- helm
-
-# Clean up 
-
-```
-CLUSTER_NAME=eks-docker-registry-proxy-cache
-AWS_ACCOUNT_ID=281387974444
-ROLE_NAME=DockerRegistryRole
-
-eksctl delete cluster --name $CLUSTER_NAME
-
-# Detach policies from role
-aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
-aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
-
-# Delete role
-aws iam delete-role --role-name $ROLE_NAME
-
-# Delete policies
-aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
-aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
-# Bucket needs to be empty
-aws s3api delete-bucket --bucket registry-denisstorti --region us-east-1
-```
-
+- [helm](https://helm.sh/docs/intro/install/)
+- [crane](https://github.com/google/go-containerregistry/blob/main/cmd/crane/README.md)
 
 # Create Cluster
 
@@ -254,7 +239,7 @@ Just remember to set in values files `values-s3-ecr-proxy.yaml`:
 
 # Configure Helm chart
 
-Check the `values-s3-ecr-proxy.yaml` file for lines with comment "MODIFIED" to understand what was changed. 
+Check the [values-s3-ecr-proxy.yaml](values-s3-ecr-proxy.yaml) file for lines with comment "MODIFIED" to understand what was changed. 
 
 Update details to match your AWS region, AWS account ID, AWS IAM role name and ECR registry URL.
 
@@ -304,4 +289,27 @@ To confirm the cache is pulling from the private ECR, you can test a tag that on
 crane copy --platform linux/amd64 nginx:latest 281387974444.dkr.ecr.us-east-1.amazonaws.com/nginx:v1
 
 kubectl run -n $NAMESPACE --rm -it nginx --image localhost:30008/nginx:v1 --restart Never sh
+```
+
+# Clean up 
+
+```
+CLUSTER_NAME=eks-docker-registry-proxy-cache
+AWS_ACCOUNT_ID=281387974444
+ROLE_NAME=DockerRegistryRole
+
+eksctl delete cluster --name $CLUSTER_NAME
+
+# Detach policies from role
+aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
+aws iam detach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
+
+# Delete role
+aws iam delete-role --role-name $ROLE_NAME
+
+# Delete policies
+aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryS3Policy
+aws iam delete-policy --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/DockerRegistryECRPolicy
+# Bucket needs to be empty
+aws s3api delete-bucket --bucket registry-denisstorti --region us-east-1
 ```
