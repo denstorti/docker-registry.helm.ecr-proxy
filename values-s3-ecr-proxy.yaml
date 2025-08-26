@@ -162,8 +162,11 @@ configData:
       enabled: true
       interval: 10s
       threshold: 3
+  delete:
+    enabled: true
   proxy:  # MODIFIED to use the custom image with the docker-credential-ecr-login helper
     remoteurl: https://281387974444.dkr.ecr.us-east-1.amazonaws.com
+    ttl: 1m # MODIFIED to 1 minute TTL
     exec: 
       command: /usr/bin/docker-credential-ecr-login
       lifetime: 12h 
@@ -257,6 +260,8 @@ extraEnvVars: # MODIFIED
   value: ""
 - name: AWS_SHARED_CREDENTIALS_FILE 
   value: "/.aws/credentials"
+- name: REGISTRY_STORAGE_DELETE_ENABLED
+  value: "true"
 
 initContainers: # MODIFIED: this is where the magic happens for AWS credentials.
 ## Init containers to add to the Deployment
@@ -308,9 +313,9 @@ initContainers: # MODIFIED: this is where the magic happens for AWS credentials.
       name: aws-credentials
 
 garbageCollect:
-  enabled: false
+  enabled: true
   deleteUntagged: true
-  schedule: "0 1 * * *"
+  schedule: "* * * * *"
   podAnnotations: {}
   podLabels: {}
   resources: {}
@@ -324,3 +329,51 @@ garbageCollect:
   # requests:
   #   cpu: 100m
   #   memory: 128Mi
+
+  initContainers: # MODIFIED: this is where the magic happens for AWS credentials.
+  ## Init containers to add to the Deployment
+  - name: credential-refresher-sidecar
+    image: public.ecr.aws/aws-cli/aws-cli:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+    image: public.ecr.aws/aws-cli/aws-cli:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+
+        # Function to get credentials
+        get_credentials() {
+          echo "Getting AWS credentials..."
+          echo WHOAMI: $(whoami)
+          echo AWS_ROLE_ARN: $AWS_ROLE_ARN
+          CREDS=$(aws sts assume-role --role-arn $AWS_ROLE_ARN --role-session-name registry-proxy-session --duration-seconds 3600 --output text)
+          ACCESS_KEY=$(echo "$CREDS" | grep CREDENTIALS | cut -f2)
+          SECRET_KEY=$(echo "$CREDS" | grep CREDENTIALS | cut -f4)
+          SESSION_TOKEN=$(echo "$CREDS" | grep CREDENTIALS | cut -f5)
+
+          cat > /root/.aws/credentials << EOF
+        [default]
+        aws_access_key_id = $ACCESS_KEY
+        aws_secret_access_key = $SECRET_KEY
+        aws_session_token = $SESSION_TOKEN
+        EOF
+
+          echo "Credentials updated at $(date)"
+        }
+
+        get_credentials
+
+    # restartPolicy: Never  # DON'T RESTART FOR GARBAGE COLLECTOR
+    securityContext:
+      runAsUser: 0
+    env:
+      - name: AWS_REGION
+        value: us-east-1
+    volumeMounts:
+      - mountPath: /root/.aws
+        name: aws-credentials

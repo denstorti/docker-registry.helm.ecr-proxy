@@ -26,6 +26,7 @@ spec:
         {{- toYaml .Values.podAnnotations | nindent 8 }}
         {{- end }}
     spec:
+      ttlSecondsAfterFinished: 300 
       template:
         metadata:
           labels:
@@ -50,6 +51,8 @@ spec:
           {{- if .Values.securityContext.enabled }}
           securityContext: {{ omit .Values.securityContext "enabled" | toYaml | nindent 12 }}
           {{- end }}
+          initContainers:
+            {{- toYaml .Values.garbageCollect.initContainers | nindent 12 }}
           containers:
             - name: {{ .Chart.Name }}
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
